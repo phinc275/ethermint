@@ -42,7 +42,6 @@ import (
 	"github.com/tendermint/tendermint/p2p"
 	pvm "github.com/tendermint/tendermint/privval"
 	"github.com/tendermint/tendermint/proxy"
-	"github.com/tendermint/tendermint/rpc/client/local"
 	dbm "github.com/tendermint/tm-db"
 
 	"github.com/cosmos/cosmos-sdk/server/rosetta"
@@ -66,6 +65,11 @@ import (
 	"github.com/evmos/ethermint/server/config"
 	srvflags "github.com/evmos/ethermint/server/flags"
 	ethermint "github.com/evmos/ethermint/types"
+
+	rollconf "github.com/rollkit/rollkit/config"
+	rollconv "github.com/rollkit/rollkit/conv"
+	rollnode "github.com/rollkit/rollkit/node"
+	rollrpc "github.com/rollkit/rollkit/rpc"
 )
 
 // DBOpener is a function to open `application.db`, potentially with customized options.
@@ -222,6 +226,7 @@ which accepts a path for the resulting pprof file.
 
 	// add support for all Tendermint-specific command line options
 	tcmd.AddNodeFlags(cmd)
+	rollconf.AddFlags(cmd)
 	return cmd
 }
 
@@ -357,10 +362,25 @@ func startInProcess(ctx *server.Context, clientCtx client.Context, opts StartOpt
 		return err
 	}
 
+	pval := pvm.LoadOrGenFilePV(cfg.PrivValidatorKeyFile(), cfg.PrivValidatorStateFile())
+	if err != nil {
+		return err
+	}
+	// keys in rollkit format
+	p2pKey, err := rollconv.GetNodeKey(nodeKey)
+	if err != nil {
+		return err
+	}
+	signingKey, err := rollconv.GetNodeKey(&p2p.NodeKey{PrivKey: pval.Key.PrivKey})
+	if err != nil {
+		return err
+	}
+
 	genDocProvider := node.DefaultGenesisDocProviderFunc(cfg)
 
 	var (
-		tmNode   *node.Node
+		tmNode   rollnode.Node
+		srv      *rollrpc.Server
 		gRPCOnly = ctx.Viper.GetBool(srvflags.GRPCOnly)
 	)
 
@@ -371,18 +391,38 @@ func startInProcess(ctx *server.Context, clientCtx client.Context, opts StartOpt
 	} else {
 		logger.Info("starting node with ABCI Tendermint in-process")
 
-		tmNode, err = node.NewNode(
-			cfg,
-			pvm.LoadOrGenFilePV(cfg.PrivValidatorKeyFile(), cfg.PrivValidatorStateFile()),
-			nodeKey,
+		genesis, err := genDocProvider()
+		if err != nil {
+			return err
+		}
+		nodeConfig := rollconf.NodeConfig{}
+		err = nodeConfig.GetViperConfig(ctx.Viper)
+		if err != nil {
+			return err
+		}
+		rollconv.GetNodeConfig(&nodeConfig, cfg)
+		err = rollconv.TranslateAddresses(&nodeConfig)
+		if err != nil {
+			return err
+		}
+
+		tmNode, err = rollnode.NewNode(
+			context.Background(),
+			nodeConfig,
+			p2pKey,
+			signingKey,
 			proxy.NewLocalClientCreator(app),
-			genDocProvider,
-			node.DefaultDBProvider,
-			node.DefaultMetricsProvider(cfg.Instrumentation),
+			genesis,
 			ctx.Logger.With("server", "node"),
 		)
 		if err != nil {
 			logger.Error("failed init node", "error", err.Error())
+			return err
+		}
+
+		srv = rollrpc.NewServer(tmNode, cfg.RPC, ctx.Logger)
+		err = srv.Start()
+		if err != nil {
 			return err
 		}
 
@@ -401,8 +441,8 @@ func startInProcess(ctx *server.Context, clientCtx client.Context, opts StartOpt
 	// Add the tx service to the gRPC router. We only need to register this
 	// service if API or gRPC or JSONRPC is enabled, and avoid doing so in the general
 	// case, because it spawns a new local tendermint RPC client.
-	if (config.API.Enable || config.GRPC.Enable || config.JSONRPC.Enable || config.JSONRPC.EnableIndexer) && tmNode != nil {
-		clientCtx = clientCtx.WithClient(local.New(tmNode))
+	if (config.API.Enable || config.GRPC.Enable || config.JSONRPC.Enable || config.JSONRPC.EnableIndexer) && tmNode != nil && srv != nil {
+		clientCtx = clientCtx.WithClient(srv.Client())
 
 		app.RegisterTxService(clientCtx)
 		app.RegisterTendermintService(clientCtx)
